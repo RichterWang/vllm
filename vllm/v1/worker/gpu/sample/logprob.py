@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from bisect import bisect_left
+
 import numpy as np
 import torch
 
 import vllm.envs as envs
+from vllm.platforms import current_platform
 from vllm.sampling_params import MAX_LOGPROB_TOKEN_IDS, SamplingParams
 from vllm.triton_utils import tl, triton
 from vllm.utils.platform_utils import num_compute_units
@@ -33,6 +36,36 @@ _BLOCK_SIZE = 1024
 _SPLIT_TARGET_PROGRAMS_PER_SM = 2
 _SPLIT_MIN_CHUNK_SIZE = 8192
 _MAX_VOCAB_SPLITS = 64
+# Offline measured on a 46-SM sm86 GPU. Small workloads retain the original
+# choice because the extra launch overhead can outweigh device-time savings.
+# Other devices keep the original conservative heuristic.
+_MEASURED_SPLIT_TUNING = {(8, 6, 46): (64, 1024)}
+_MEASURED_SPLIT_MIN_VOCAB = 49152
+_MEASURED_SPLIT_MIN_LOGITS = 2_300_000
+_AUTOTUNED_SPLITS: dict[
+    tuple[int, torch.dtype, int], tuple[tuple[int, ...], tuple[int, ...]]
+] = {}
+_AUTOTUNED_DEVICE_INDEX: int | None = None
+
+
+def _set_autotuned_split_profile(profile: dict, device: torch.device) -> None:
+    """Install a startup-calibrated split table for this worker process."""
+    global _AUTOTUNED_SPLITS, _AUTOTUNED_DEVICE_INDEX
+    dtype = getattr(torch, profile["dtype"])
+    key = (profile["vocab_size"], dtype, profile["num_logprobs"])
+    rows = profile["rows"]
+    device_index = (
+        device.index
+        if device.index is not None
+        else torch.accelerator.current_device_index()
+    )
+    if device_index != _AUTOTUNED_DEVICE_INDEX:
+        _AUTOTUNED_SPLITS = {}
+    _AUTOTUNED_SPLITS[key] = (
+        tuple(row["batch_size"] for row in rows),
+        tuple(row["chosen_splits"] for row in rows),
+    )
+    _AUTOTUNED_DEVICE_INDEX = device_index
 
 
 @triton.jit
@@ -228,7 +261,9 @@ def _ranks_kernel(
 def _get_num_compute_units(device: torch.device) -> int:
     try:
         return num_compute_units(
-            device.index if device.index is not None else torch.cuda.current_device()
+            device.index
+            if device.index is not None
+            else torch.accelerator.current_device_index()
         )
     except Exception:
         # Platform does not expose its compute-unit count; disable splitting.
@@ -236,24 +271,63 @@ def _get_num_compute_units(device: torch.device) -> int:
 
 
 def _get_num_vocab_splits(
-    batch_size: int, vocab_size: int, device: torch.device
+    batch_size: int,
+    vocab_size: int,
+    device: torch.device,
+    dtype: torch.dtype | None = None,
+    num_logprobs: int | None = None,
 ) -> int:
     """Number of programs to split each row's vocab across.
 
-    One program per row leaves most SMs idle for small decode batches (the
-    common case), so split each row across up to `_SPLIT_TARGET_PROGRAMS_PER_SM
-    * num_SMs / batch_size` programs, each handling at least
-    `_SPLIT_MIN_CHUNK_SIZE` logits. Returns 1 (the fused single-kernel path)
-    when splitting would not help, and always under VLLM_BATCH_INVARIANT since
-    the split count depends on the batch size and changes the FP32
-    accumulation order.
+    One program per row leaves most SMs idle for small decode batches. The
+    default limits split programs by SM count and minimum chunk size; a measured
+    device/shape entry may use a more aggressive pair of limits. Returns 1 for
+    the fused path when splitting is not selected, and always under
+    VLLM_BATCH_INVARIANT because split count changes FP32 accumulation order.
     """
     if envs.VLLM_BATCH_INVARIANT:
         return 1
-    target_programs = _get_num_compute_units(device) * _SPLIT_TARGET_PROGRAMS_PER_SM
+    if _AUTOTUNED_SPLITS and dtype is not None and num_logprobs is not None:
+        device_index = (
+            device.index
+            if device.index is not None
+            else torch.accelerator.current_device_index()
+        )
+        if device.type == "cuda" and device_index == _AUTOTUNED_DEVICE_INDEX:
+            choice = _AUTOTUNED_SPLITS.get((vocab_size, dtype, num_logprobs))
+            if choice is not None:
+                batches, splits = choice
+                # The next measured batch bounds the work for an intermediate B.
+                # Beyond the measured range, retain the existing fallback rule.
+                index = bisect_left(batches, batch_size)
+                if index < len(batches):
+                    return splits[index]
+    num_sms = _get_num_compute_units(device)
+    target_per_sm = _SPLIT_TARGET_PROGRAMS_PER_SM
+    min_chunk_size = _SPLIT_MIN_CHUNK_SIZE
+    if (
+        num_sms == 46
+        and device.type == "cuda"
+        and vocab_size >= _MEASURED_SPLIT_MIN_VOCAB
+        and batch_size * vocab_size >= _MEASURED_SPLIT_MIN_LOGITS
+    ):
+        device_index = (
+            device.index
+            if device.index is not None
+            else torch.accelerator.current_device_index()
+        )
+        capability = current_platform.get_device_capability(device_index)
+        tuning = (
+            _MEASURED_SPLIT_TUNING.get((capability.major, capability.minor, num_sms))
+            if capability is not None
+            else None
+        )
+        if tuning is not None:
+            target_per_sm, min_chunk_size = tuning
+    target_programs = num_sms * target_per_sm
     num_splits = min(
         target_programs // max(batch_size, 1),
-        triton.cdiv(vocab_size, _SPLIT_MIN_CHUNK_SIZE),
+        triton.cdiv(vocab_size, min_chunk_size),
         _MAX_VOCAB_SPLITS,
     )
     if num_splits < 2:
@@ -302,7 +376,9 @@ def compute_token_logprobs(
     topk_block_size = min(triton.next_power_of_2(num_logprobs), _MAX_TOPK_BLOCK)
 
     if num_vocab_splits is None:
-        num_vocab_splits = _get_num_vocab_splits(batch_size, vocab_size, logits.device)
+        num_vocab_splits = _get_num_vocab_splits(
+            batch_size, vocab_size, logits.device, logits.dtype, num_logprobs
+        )
     assert num_vocab_splits >= 1
 
     if num_vocab_splits == 1:

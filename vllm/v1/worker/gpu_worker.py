@@ -589,6 +589,35 @@ class Worker(WorkerBase):
         # valid when requests arrive.
         set_torch_threads_for_runtime()
 
+        if self.use_v2_model_runner and os.getenv("VLLM_TOKEN_LOGPROB_AUTOTUNE") == "1":
+            from vllm.v1.worker.gpu.sample.logprob_autotune import (
+                initialize_split_autotune,
+            )
+
+            try:
+                requested = os.getenv("VLLM_TOKEN_LOGPROB_AUTOTUNE_KS", "6")
+                ks = list(dict.fromkeys(int(value) for value in requested.split(",")))
+                if not ks or any(k < 1 or k > 129 for k in ks):
+                    raise ValueError("Autotune K values must be in [1, 129]")
+                for k in ks:
+                    result = initialize_split_autotune(
+                        vocab_size=self.model_config.get_vocab_size(),
+                        dtype=self.model_config.dtype,
+                        num_logprobs=k,
+                        device=self.device,
+                    )
+                    logger.info(
+                        "Token-logprob split autotune K=%d: %s, "
+                        "initialization %.3fs, calibration %.3fs, cache %s",
+                        k,
+                        result["status"],
+                        result["init_seconds"],
+                        result["calibration_seconds"],
+                        result["cache_path"],
+                    )
+            except Exception:
+                logger.exception("Token-logprob split autotune failed; using fallback")
+
     def update_config(self, overrides: dict[str, Any]) -> None:
         self.model_runner.update_config(overrides)
 

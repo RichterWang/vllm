@@ -1827,3 +1827,76 @@ def test_num_vocab_splits_heuristic(monkeypatch, num_sms, batch_size, vocab_size
     # Split count depends on batch size, so batch-invariant mode disables it.
     monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True, raising=False)
     assert logprob_mod._get_num_vocab_splits(batch_size, vocab_size, dev) == 1
+
+
+def test_num_vocab_splits_measured_sm86_policy(monkeypatch):
+    import vllm.envs as envs
+    from vllm.v1.worker.gpu.sample import logprob as logprob_mod
+
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", False, raising=False)
+    monkeypatch.setattr(logprob_mod, "_get_num_compute_units", lambda _: 46)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _: (8, 6))
+    dev = torch.device("cuda")
+    for batch_size, vocab_size, expected in (
+        (1, 3001, 1),
+        (1, 8192, 1),
+        (1, 32768, 4),
+        (1, 151936, 16),
+        (16, 151936, 64),
+        (17, 151936, 64),
+        (33, 49152, 2),
+        (49, 49152, 32),
+        (128, 151936, 16),
+    ):
+        assert (
+            logprob_mod._get_num_vocab_splits(batch_size, vocab_size, dev) == expected
+        )
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _: (9, 0))
+    assert logprob_mod._get_num_vocab_splits(128, 151936, dev) == 1
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True, raising=False)
+    assert logprob_mod._get_num_vocab_splits(1, 151936, dev) == 1
+
+
+def test_num_vocab_splits_autotuned_profile_and_fallback(monkeypatch):
+    import vllm.envs as envs
+    from vllm.v1.worker.gpu.sample import logprob as logprob_mod
+
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", False, raising=False)
+    monkeypatch.setattr(logprob_mod, "_AUTOTUNED_DEVICE_INDEX", 0)
+    monkeypatch.setattr(
+        logprob_mod,
+        "_AUTOTUNED_SPLITS",
+        {(151936, torch.bfloat16, 6): ((1, 8, 16), (16, 8, 32))},
+    )
+    monkeypatch.setattr(logprob_mod, "_get_num_compute_units", lambda _: 0)
+    device = torch.device("cuda:0")
+    assert logprob_mod._get_num_vocab_splits(9, 151936, device, torch.bfloat16, 6) == 32
+    assert logprob_mod._get_num_vocab_splits(17, 151936, device, torch.bfloat16, 6) == 1
+    assert logprob_mod._get_num_vocab_splits(9, 151936, device, torch.bfloat16, 7) == 1
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True, raising=False)
+    assert logprob_mod._get_num_vocab_splits(9, 151936, device, torch.bfloat16, 6) == 1
+
+
+def test_autotuned_profiles_for_multiple_k_values(monkeypatch):
+    from vllm.v1.worker.gpu.sample import logprob as logprob_mod
+
+    monkeypatch.setattr(logprob_mod, "_AUTOTUNED_SPLITS", {})
+    monkeypatch.setattr(logprob_mod, "_AUTOTUNED_DEVICE_INDEX", None)
+    device = torch.device("cuda:0")
+    for k, splits in ((1, 16), (6, 32)):
+        logprob_mod._set_autotuned_split_profile(
+            {
+                "vocab_size": 151936,
+                "dtype": "bfloat16",
+                "num_logprobs": k,
+                "rows": [{"batch_size": 16, "chosen_splits": splits}],
+            },
+            device,
+        )
+    assert (
+        logprob_mod._get_num_vocab_splits(16, 151936, device, torch.bfloat16, 1) == 16
+    )
+    assert (
+        logprob_mod._get_num_vocab_splits(16, 151936, device, torch.bfloat16, 6) == 32
+    )
